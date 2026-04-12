@@ -1070,6 +1070,14 @@ async function bootFirebase() {
   window.DB   = firebase.firestore();
   window.AUTH = firebase.auth();
 
+  // If returning from Google redirect, show loading immediately
+  // This prevents the login screen flashing before auth resolves
+  if (document.referrer.includes('accounts.google.com') ||
+      sessionStorage.getItem('googleRedirectPending')) {
+    showLoading(true);
+    sessionStorage.removeItem('googleRedirectPending');
+  }
+
   // Offline persistence
   try { await DB.enablePersistence({synchronizeTabs:true}); } catch(e) {}
 
@@ -1221,8 +1229,22 @@ async function bootFirebase() {
     },
   };
 
-  // Handle redirect sign-in result
-  try { const r = await AUTH.getRedirectResult(); if(r?.user) console.log('Redirect sign-in OK:', r.user.email); } catch(e) {}
+  // Handle Google redirect sign-in result
+  try {
+    const r = await AUTH.getRedirectResult();
+    if (r?.user) {
+      console.log('✅ Google redirect sign-in OK:', r.user.email);
+      // onAuthStateChanged will also fire — that's fine, onUserLoggedIn handles it
+    }
+  } catch(e) {
+    if (e.code !== 'auth/no-auth-event' && e.code !== 'auth/null-user') {
+      console.error('Redirect result error:', e.code, e.message);
+      showLoading(false);
+      if (e.code === 'auth/unauthorized-domain') {
+        showToast('⚠️ Add this domain to Firebase Auth → Authorized domains', true);
+      }
+    }
+  }
 
   // Auth state
   AUTH.onAuthStateChanged(async user => {
@@ -1695,23 +1717,42 @@ function switchTab(tab, el) {
 // ════════════════════════════
 async function signinGoogle() {
   try {
-    // Detect environment: use redirect for Capacitor/local, popup for web hosting
-    const isNative  = window.Capacitor?.isNativePlatform?.();
-    const isLocal   = location.protocol === 'file:' || location.protocol === 'content:';
-    const useRedirect = isNative || isLocal;
-    await FB.googleSignIn(useRedirect);
-    // If popup: onAuthStateChanged fires automatically
-    // If redirect: page reloads, getRedirectResult() handles it in bootFirebase
+    // Always use redirect on mobile (popup blocked by Chrome on Android)
+    // Use popup only on desktop browsers
+    const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+    const isNative = window.Capacitor?.isNativePlatform?.();
+    const isLocal  = location.protocol === 'file:' || location.protocol === 'content:';
+    const useRedirect = isMobile || isNative || isLocal;
+
+    if (useRedirect) {
+      // Show loading before redirect — page will reload after Google auth
+      showLoading(true);
+      sessionStorage.setItem('googleRedirectPending', '1');
+      await FB.googleSignIn(true);
+      // Execution stops here — page redirects to Google, then back
+    } else {
+      // Desktop popup
+      const user = await FB.googleSignIn(false);
+      if (user) console.log('Popup sign-in OK:', user.email);
+    }
   } catch(err) {
     showLoading(false);
-    const msg = err.code === 'auth/popup-closed-by-user'    ? 'Sign in cancelled'
-              : err.code === 'auth/cancelled-popup-request'  ? 'Sign in cancelled — please try again'
-              : err.code === 'auth/popup-blocked'            ? 'Allow popups for this site and try again'
-              : err.code === 'auth/network-request-failed'   ? 'No internet connection'
-              : err.code === 'auth/operation-not-allowed'    ? 'Google sign-in not enabled — check Firebase Console'
-              : err.code === 'auth/unauthorized-domain'      ? 'This domain is not authorised in Firebase — add it in Firebase Console → Authentication → Authorised domains'
-              : 'Sign in failed: ' + (err.message || err.code || err);
-    showToast(msg, true);
+    const codes = {
+      'auth/popup-closed-by-user':    'Sign in cancelled',
+      'auth/cancelled-popup-request': 'Sign in cancelled — tap the button once',
+      'auth/popup-blocked':           'Popup blocked — signing in with redirect instead',
+      'auth/network-request-failed':  'No internet connection',
+      'auth/unauthorized-domain':     '⚠️ Add this domain to Firebase Auth → Authorized domains',
+      'auth/operation-not-allowed':   'Google sign-in not enabled in Firebase',
+    };
+    const msg = codes[err.code] || ('Sign in failed: ' + (err.message || err.code));
+    // If popup blocked, retry with redirect
+    if (err.code === 'auth/popup-blocked') {
+      showLoading(true);
+      await FB.googleSignIn(true).catch(e2 => { showLoading(false); showToast('Sign in failed: ' + e2.code, true); });
+    } else {
+      showToast(msg, true);
+    }
   }
 }
 
@@ -1720,14 +1761,22 @@ async function doEmailLogin() {
   const pass  = document.getElementById('passwordInput').value;
   const name  = document.getElementById('signupName')?.value.trim() || '';
   if (!email || !pass) { showToast('Fill in all fields', true); return; }
+  if (pass.length < 6) { showToast('Password must be at least 6 characters', true); return; }
   showLoading(true);
   try {
-    // Try sign in first, then sign up if user not found
     try {
       await FB.emailSignIn(email, pass);
+      console.log('Email sign-in OK:', email);
     } catch(err) {
-      if (err.code === 'auth/user-not-found' || err.code === 'auth/invalid-credential') {
-        await FB.emailSignUp(email, pass, name || email.split('@')[0]);
+      if (err.code === 'auth/user-not-found' || err.code === 'auth/invalid-credential' || err.code === 'auth/wrong-password') {
+        // Check if signup mode is active
+        const isSignup = document.getElementById('signupNameGroup')?.style.display !== 'none';
+        if (isSignup) {
+          await FB.emailSignUp(email, pass, name || email.split('@')[0]);
+          console.log('Email sign-up OK:', email);
+        } else {
+          throw err; // Not in signup mode — show error
+        }
       } else throw err;
     }
     closeModal('emailModal');
